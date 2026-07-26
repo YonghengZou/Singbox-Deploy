@@ -253,6 +253,10 @@ ensure_sysctl "net.ipv4.tcp_window_scaling" "1"
 ensure_sysctl "net.ipv4.tcp_sack" "1"
 ensure_sysctl "net.ipv4.tcp_timestamps" "1"
 
+# swappiness：小内存机器(1GB)尽量用内存少用 swap，避免代理卡顿。
+# 0=尽量不用swap，10=平衡值（推荐），60=默认。这里设10。
+ensure_sysctl "vm.swappiness" "10"
+
 sudo sysctl -p > /dev/null
 
 # 验证关键项是否生效。
@@ -262,8 +266,9 @@ CURRENT_TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "未知")
 CURRENT_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
 CURRENT_CONNTRACK=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "未加载")
 CURRENT_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "未知")
+CURRENT_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || echo "未知")
 echo "✅ qdisc=$CURRENT_QDISC  CC=$CURRENT_CC  TFO=$CURRENT_TFO  rmem_max=$CURRENT_RMEM"
-echo "✅ conntrack_max=$CURRENT_CONNTRACK  somaxconn=$CURRENT_SOMAXCONN"
+echo "✅ conntrack_max=$CURRENT_CONNTRACK  somaxconn=$CURRENT_SOMAXCONN  swappiness=$CURRENT_SWAPPINESS"
 
 echo ""
 echo "################################################"
