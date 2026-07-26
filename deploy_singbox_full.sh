@@ -217,12 +217,32 @@ ensure_sysctl() {
 
 ensure_sysctl "net.core.default_qdisc" "fq"
 ensure_sysctl "net.ipv4.tcp_congestion_control" "bbr"
+
+# UDP 缓冲区调优：sing-box 官方推荐，对 Hysteria2/QUIC 高带宽场景最关键。
+# 默认值通常只有 ~200KB，高带宽下会因缓冲区不足导致丢包限速。
+ensure_sysctl "net.core.rmem_max" "16777216"
+ensure_sysctl "net.core.wmem_max" "16777216"
+ensure_sysctl "net.core.rmem_default" "16777216"
+ensure_sysctl "net.core.wmem_default" "16777216"
+ensure_sysctl "net.core.netdev_max_backlog" "5000"
+
+# TCP Fast Open：减少一次 RTT，对短连接和重连有效（3=客户端+服务端都启用）。
+ensure_sysctl "net.ipv4.tcp_fastopen" "3"
+# 避免空闲连接重新进入慢启动。
+ensure_sysctl "net.ipv4.tcp_slow_start_after_idle" "0"
+# 自动探测路径 MTU，避免分片丢包。
+ensure_sysctl "net.ipv4.tcp_mtu_probing" "1"
+# 降低发送队列低水位，减少缓冲延迟。
+ensure_sysctl "net.ipv4.tcp_notsent_lowat" "16384"
+
 sudo sysctl -p > /dev/null
 
-# 验证是否生效。
+# 验证关键项是否生效。
 CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
 CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-echo "✅ 当前 qdisc: $CURRENT_QDISC，TCP 拥塞控制: $CURRENT_CC"
+CURRENT_TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "未知")
+CURRENT_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
+echo "✅ qdisc=$CURRENT_QDISC  TCP CC=$CURRENT_CC  TFO=$CURRENT_TFO  rmem_max=$CURRENT_RMEM"
 
 echo ""
 echo "################################################"
