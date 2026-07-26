@@ -1,5 +1,7 @@
-# Singbox 一键部署 / One-Click Deploy
+# Singbox Deploy
 
+> 一键部署 sing-box + Reality + Nginx 订阅服务 / One-click deploy of sing-box + Reality + Nginx subscription service
+>
 > [中文](#中文) | [English](#english)
 
 ---
