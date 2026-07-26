@@ -27,7 +27,7 @@ SUB_PORT="${SUB_PORT:-8443}"
 HY2_PORT="${HY2_PORT:-8444}"
 # Hysteria2 使用的域名（用于自签证书的 CN/SAN，客户端可设 insecure=1 或自行替换为真实证书）。
 HY2_DOMAIN="${HY2_DOMAIN:-singbox.local}"
-REALITY_SNI="${REALITY_SNI:-swdist.apple.com}"
+REALITY_SNI="${REALITY_SNI:-www.cloudflare.com}"
 SHOW_SECRETS="${SHOW_SECRETS:-0}"
 
 # --- 针对小机型（如 E2.1.Micro：1 OCPU/1GB/0.48Gbps）的内存相关参数 ---
