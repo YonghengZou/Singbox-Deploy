@@ -33,7 +33,7 @@
 ### 4.1 先下载脚本
 
 ```bash
-git clone <你的仓库地址>
+git clone https://github.com/YonghengZou/Singbox-Deploy.git
 cd Singbox-Deploy
 ```
 
