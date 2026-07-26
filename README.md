@@ -27,6 +27,7 @@
 ## 3. 主要文件
 
 - [deploy_singbox_full.sh](deploy_singbox_full.sh)：完整部署脚本
+- [LICENSE](LICENSE)：项目许可证
 
 ## 4. 使用方法
 
