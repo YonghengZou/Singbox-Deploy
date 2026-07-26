@@ -8,8 +8,9 @@
 # 新增内容：
 #   - swap 文件（防止 1GB 内存下 OOM 拖慢/杀死进程）
 #   - VLESS+Reality 开启 XTLS Vision 流控（flow: xtls-rprx-vision），降低加解密开销
-#   - Hysteria2 显式设置 up_mbps/down_mbps，避免拥塞控制估算过激或过保守
-#   - 订阅链接（通用 txt / Clash yaml）同步带上以上参数，客户端才能生效
+#   - sing-box 服务提升文件描述符上限（LimitNOFILE）
+#   - Hysteria2 不手动设置 up_mbps/down_mbps：手动设置在小机型上容易因
+#     Brutal 拥塞控制按固定速率发送导致丢包甚至 timeout，交给默认协商更稳定
 #
 set -e
 
@@ -29,11 +30,12 @@ HY2_DOMAIN="${HY2_DOMAIN:-singbox.local}"
 REALITY_SNI="${REALITY_SNI:-swdist.apple.com}"
 SHOW_SECRETS="${SHOW_SECRETS:-0}"
 
-# --- 针对小机型（如 E2.1.Micro：1 OCPU/1GB/0.48Gbps）的带宽/内存相关参数 ---
-# 两个协议同时跑时，Hysteria2 的带宽估算不宜设太高，否则拥塞控制会在单核 CPU
-# 加解密跟不上时依然按高速率发送，反而加剧丢包。可通过环境变量覆盖。
-HY2_UP_MBPS="${HY2_UP_MBPS:-150}"
-HY2_DOWN_MBPS="${HY2_DOWN_MBPS:-150}"
+# --- 针对小机型（如 E2.1.Micro：1 OCPU/1GB/0.48Gbps）的内存相关参数 ---
+# 说明：Hysteria2 的 up_mbps/down_mbps 手动带宽限制已移除。
+# 原因：Brutal 拥塞控制会严格按设定值发送，一旦设置的数值超出服务器实际
+# 承载能力（尤其是和 VLESS 共用 1 个 OCPU 时），会导致大量丢包甚至连接
+# timeout，而不是简单的"变慢"。不设置时 sing-box/客户端会走默认的带宽
+# 协商机制，更保守也更稳定，避免这个问题。
 # swap 大小（GB），1GB 内存机型建议保留，避免内存紧张时被 OOM killer 杀掉服务进程。
 SWAP_SIZE_GB="${SWAP_SIZE_GB:-1}"
 
@@ -181,8 +183,8 @@ echo "################################################"
 # 写入 sing-box 的服务端配置文件：使用 VLESS + Reality 方案。
 # 其中 UUID、私钥和 ShortID 由上一步生成并复用。
 # 【优化】VLESS 用户加 flow: xtls-rprx-vision，减少一层内层 TLS 加解密开销，提速明显。
-# 【优化】Hysteria2 inbound 显式设置 up_mbps/down_mbps，避免拥塞控制估算不准
-#         （两个协议共用 1 个 OCPU 时尤其重要，数值可用 HY2_UP_MBPS/HY2_DOWN_MBPS 环境变量覆盖）。
+# 【说明】Hysteria2 不再手动设置 up_mbps/down_mbps，交给默认机制协商带宽，
+#         避免手动设置过高导致 Brutal 拥塞控制丢包、连接 timeout。
 sudo tee /etc/sing-box/config.json > /dev/null << EOF
 {
   "log": {
@@ -218,8 +220,6 @@ sudo tee /etc/sing-box/config.json > /dev/null << EOF
       "type": "hysteria2",
       "listen": "::",
       "listen_port": ${HY2_PORT},
-      "up_mbps": ${HY2_UP_MBPS},
-      "down_mbps": ${HY2_DOWN_MBPS},
       "users": [
         {
           "password": "${HY2_PASSWORD}"
@@ -242,7 +242,7 @@ EOF
 
 sudo chmod 600 /etc/sing-box/config.json
 sudo sing-box check -c /etc/sing-box/config.json
-echo "✅ 配置文件语法检查通过（VLESS Vision + Hysteria2 带宽限制已启用）"
+echo "✅ 配置文件语法检查通过（VLESS Vision 已启用，Hysteria2 使用默认带宽协商）"
 
 echo ""
 echo "################################################"
@@ -433,8 +433,9 @@ VLESS_URI="vless://${UUID}@${SERVER_IP}:${LISTEN_PORT}?encryption=none&security=
 
 # 生成 Hysteria2 链接（基于 QUIC/UDP）。
 # insecure=1 表示跳过自签证书校验，方便快速使用；如使用真实证书可去掉该参数。
-# 【优化】加上 up/down 参数，与服务端 up_mbps/down_mbps 对应，帮助客户端更准确地估算带宽。
-HY2_URI="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}?sni=${HY2_DOMAIN}&insecure=1&up=${HY2_UP_MBPS}&down=${HY2_DOWN_MBPS}#my-hysteria2"
+# 不再手动指定 up/down 带宽参数，交由客户端与服务端自动协商，避免手动设置
+# 过高导致 timeout。
+HY2_URI="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}?sni=${HY2_DOMAIN}&insecure=1#my-hysteria2"
 
 # 多节点订阅：将两条链接按行拼接后整体 base64 编码。
 ENCODED=$(printf "%s\n%s" "$VLESS_URI" "$HY2_URI" | base64 -w 0)
@@ -455,8 +456,6 @@ VLESS_URI=${VLESS_URI}
 HY2_PASSWORD=${HY2_PASSWORD}
 HY2_DOMAIN=${HY2_DOMAIN}
 HY2_URI=${HY2_URI}
-HY2_UP_MBPS=${HY2_UP_MBPS}
-HY2_DOWN_MBPS=${HY2_DOWN_MBPS}
 SUB_URL_TXT=http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.txt
 SUB_URL_YAML=http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.yaml
 EOF
@@ -494,8 +493,6 @@ proxies:
     password: ${HY2_PASSWORD}
     sni: ${HY2_DOMAIN}
     skip-cert-verify: true
-    up: ${HY2_UP_MBPS} Mbps
-    down: ${HY2_DOWN_MBPS} Mbps
 
 proxy-groups:
   - name: "PROXY"
@@ -553,7 +550,6 @@ echo "Vision 流控:       已启用 (xtls-rprx-vision)"
 echo ""
 echo "Hysteria2 密码:    $HY2_PASSWORD"
 echo "Hysteria2 域名:    $HY2_DOMAIN"
-echo "Hysteria2 带宽:    up=${HY2_UP_MBPS}Mbps down=${HY2_DOWN_MBPS}Mbps（可用 HY2_UP_MBPS/HY2_DOWN_MBPS 环境变量调整）"
 echo ""
 echo "--- VLESS+Reality 链接 (TCP) ---"
 echo "$VLESS_URI"
