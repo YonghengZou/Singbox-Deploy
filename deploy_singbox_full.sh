@@ -15,6 +15,10 @@ umask 077
 SING_BOX_VERSION="1.13.14"
 LISTEN_PORT="${LISTEN_PORT:-443}"
 SUB_PORT="${SUB_PORT:-8443}"
+# Hysteria2 基于 QUIC/UDP，与 VLESS+Reality(TCP) 互补，提供 UDP 代理能力。
+HY2_PORT="${HY2_PORT:-8444}"
+# Hysteria2 使用的域名（用于自签证书的 CN/SAN，客户端可设 insecure=1 或自行替换为真实证书）。
+HY2_DOMAIN="${HY2_DOMAIN:-singbox.local}"
 REALITY_SNI="${REALITY_SNI:-swdist.apple.com}"
 SHOW_SECRETS="${SHOW_SECRETS:-0}"
 
@@ -87,6 +91,48 @@ fi
 
 echo ""
 echo "################################################"
+echo "# 2b. 生成/复用 Hysteria2 密码与自签证书         #"
+echo "################################################"
+
+# Hysteria2 是基于 QUIC 的代理协议，原生支持 UDP，与 VLESS+Reality(TCP) 互补。
+# 这里生成一个随机密码，并使用 openssl 自签一张证书（客户端可设 insecure=1 跳过验证）。
+HY2_STATE_FILE="${STATE_DIR}/hy2.env"
+HY2_CERT_DIR="${STATE_DIR}/hy2_certs"
+
+if [ -f "$HY2_STATE_FILE" ]; then
+    echo "✅ 检测到已保存的 Hysteria2 配置，复用现有密码与证书。"
+    source "$HY2_STATE_FILE"
+else
+    echo "未检测到 Hysteria2 配置，首次生成..."
+    HY2_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-22)
+    sudo install -d -m 700 "$HY2_CERT_DIR"
+    # 生成自签证书（包含 SAN，避免部分客户端严格校验）。
+    sudo openssl ecparam -genkey -name prime256v1 -out "${HY2_CERT_DIR}/key.pem" 2>/dev/null \
+        || sudo openssl genrsa -out "${HY2_CERT_DIR}/key.pem" 2048
+    sudo openssl req -new -x509 -days 3650 \
+        -key "${HY2_CERT_DIR}/key.pem" \
+        -out "${HY2_CERT_DIR}/cert.pem" \
+        -subj "/CN=${HY2_DOMAIN}" \
+        -addext "subjectAltName=DNS:${HY2_DOMAIN}" 2>/dev/null
+    sudo chmod 600 "${HY2_CERT_DIR}/key.pem"
+
+    sudo tee "$HY2_STATE_FILE" > /dev/null << EOF
+HY2_PASSWORD=${HY2_PASSWORD}
+HY2_DOMAIN=${HY2_DOMAIN}
+EOF
+    sudo chmod 600 "$HY2_STATE_FILE"
+    echo "✅ Hysteria2 密码与自签证书已生成并保存"
+fi
+
+if [ "$SHOW_SECRETS" = "1" ]; then
+    echo "HY2 Password: $HY2_PASSWORD"
+    echo "HY2 Domain:   $HY2_DOMAIN"
+else
+    echo "ℹ️  Hysteria2 密码详情默认不打印（设置 SHOW_SECRETS=1 可查看）。"
+fi
+
+echo ""
+echo "################################################"
 echo "# 3. 写入服务端配置                             #"
 echo "################################################"
 
@@ -121,6 +167,21 @@ sudo tee /etc/sing-box/config.json > /dev/null << EOF
           "short_id": ["${SHORT_ID}"]
         }
       }
+    },
+    {
+      "type": "hysteria2",
+      "listen": "::",
+      "listen_port": ${HY2_PORT},
+      "users": [
+        {
+          "password": "${HY2_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${HY2_CERT_DIR}/cert.pem",
+        "key_path": "${HY2_CERT_DIR}/key.pem"
+      }
     }
   ],
   "outbounds": [
@@ -134,6 +195,34 @@ EOF
 sudo chmod 600 /etc/sing-box/config.json
 sudo sing-box check -c /etc/sing-box/config.json
 echo "✅ 配置文件语法检查通过"
+
+echo ""
+echo "################################################"
+echo "# 3b. 开启 BBR 拥塞控制（幂等）                  #"
+echo "################################################"
+
+# BBR 是 TCP 拥塞控制算法，对 VLESS+Reality(TCP) 和订阅服务有明显加速效果。
+# Hysteria2 走 QUIC/UDP，不直接受 tcp_congestion_control 影响，但 fq qdisc 对 UDP 也有益。
+# 这里采用幂等写法：先检查是否已配置，避免重复追加到 sysctl.conf。
+ensure_sysctl() {
+    local key=$1
+    local value=$2
+    if sudo grep -qE "^\s*${key}\s*=" /etc/sysctl.conf; then
+        # 已存在则更新为期望值（用 sed 原地替换该行，避免重复条目）。
+        sudo sed -i -E "s|^\s*${key}\s*=.*|${key}=${value}|" /etc/sysctl.conf
+    else
+        echo "${key}=${value}" | sudo tee -a /etc/sysctl.conf > /dev/null
+    fi
+}
+
+ensure_sysctl "net.core.default_qdisc" "fq"
+ensure_sysctl "net.ipv4.tcp_congestion_control" "bbr"
+sudo sysctl -p > /dev/null
+
+# 验证是否生效。
+CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+echo "✅ 当前 qdisc: $CURRENT_QDISC，TCP 拥塞控制: $CURRENT_CC"
 
 echo ""
 echo "################################################"
@@ -156,6 +245,8 @@ echo "################################################"
 if command -v ufw &> /dev/null; then
     sudo ufw allow ${LISTEN_PORT}/tcp 2>/dev/null || true
     sudo ufw allow ${SUB_PORT}/tcp 2>/dev/null || true
+    # Hysteria2 基于 QUIC，必须放行 UDP。
+    sudo ufw allow ${HY2_PORT}/udp 2>/dev/null || true
     echo "✅ ufw 规则已添加（如 ufw 未启用则无影响）"
 fi
 
@@ -163,16 +254,19 @@ fi
 # 这样脚本多次执行也不会重复增加相同规则。
 add_iptables_rule_if_missing() {
     local port=$1
-    if ! sudo iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
-        sudo iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-        echo "✅ 已添加 iptables 规则：放行端口 $port"
+    local proto=${2:-tcp}
+    if ! sudo iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+        sudo iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT
+        echo "✅ 已添加 iptables 规则：放行 $proto 端口 $port"
     else
-        echo "✅ iptables 规则已存在：端口 $port，跳过"
+        echo "✅ iptables 规则已存在：$proto 端口 $port，跳过"
     fi
 }
 
 add_iptables_rule_if_missing ${LISTEN_PORT}
 add_iptables_rule_if_missing ${SUB_PORT}
+# Hysteria2 走 QUIC/UDP，单独放行 UDP 端口。
+add_iptables_rule_if_missing ${HY2_PORT} udp
 
 if ! command -v netfilter-persistent &> /dev/null; then
     echo "安装 iptables-persistent..."
@@ -182,7 +276,10 @@ sudo netfilter-persistent save
 echo "✅ iptables 规则已持久化保存"
 
 echo ""
-echo "⚠️  提醒：云平台安全组/NSG 需要单独在控制台放行 ${LISTEN_PORT} 和 ${SUB_PORT} 端口，"
+echo "⚠️  提醒：云平台安全组/NSG 需要单独在控制台放行以下端口："
+echo "    - ${LISTEN_PORT}/tcp  (VLESS+Reality)"
+echo "    - ${SUB_PORT}/tcp     (订阅服务)"
+echo "    - ${HY2_PORT}/udp    (Hysteria2 / QUIC)"
 echo "    服务器内部防火墙放行不代表云平台外层也放行。"
 
 echo ""
@@ -222,7 +319,12 @@ fi
 # 生成通用的 VLESS 链接，并将其编码为 base64，适配大多数客户端。
 VLESS_URI="vless://${UUID}@${SERVER_IP}:${LISTEN_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#my-vless-reality"
 
-ENCODED=$(echo -n "$VLESS_URI" | base64 -w 0)
+# 生成 Hysteria2 链接（基于 QUIC/UDP）。
+# insecure=1 表示跳过自签证书校验，方便快速使用；如使用真实证书可去掉该参数。
+HY2_URI="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}?sni=${HY2_DOMAIN}&insecure=1#my-hysteria2"
+
+# 多节点订阅：将两条链接按行拼接后整体 base64 编码。
+ENCODED=$(printf "%s\n%s" "$VLESS_URI" "$HY2_URI" | base64 -w 0)
 
 # 将订阅内容写入 Nginx 目录，后续通过 HTTP 地址下载。
 sudo mkdir -p /var/www/sub
@@ -237,6 +339,9 @@ UUID=${UUID}
 PUBLIC_KEY=${PUBLIC_KEY}
 SHORT_ID=${SHORT_ID}
 VLESS_URI=${VLESS_URI}
+HY2_PASSWORD=${HY2_PASSWORD}
+HY2_DOMAIN=${HY2_DOMAIN}
+HY2_URI=${HY2_URI}
 SUB_URL_TXT=http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.txt
 SUB_URL_YAML=http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.yaml
 EOF
@@ -265,12 +370,20 @@ proxies:
     reality-opts:
       public-key: ${PUBLIC_KEY}
       short-id: ${SHORT_ID}
+  - name: "my-hysteria2"
+    type: hysteria2
+    server: ${SERVER_IP}
+    port: ${HY2_PORT}
+    password: ${HY2_PASSWORD}
+    sni: ${HY2_DOMAIN}
+    skip-cert-verify: true
 
 proxy-groups:
   - name: "PROXY"
     type: select
     proxies:
       - my-vless-reality
+      - my-hysteria2
 
 rules:
   - GEOIP,CN,DIRECT
@@ -318,8 +431,14 @@ echo "PublicKey:        $PUBLIC_KEY"
 echo "ShortID:          $SHORT_ID"
 echo "伪装域名 (SNI):    $REALITY_SNI"
 echo ""
-echo "--- 单节点 VLESS 链接 ---"
+echo "Hysteria2 密码:    $HY2_PASSWORD"
+echo "Hysteria2 域名:    $HY2_DOMAIN"
+echo ""
+echo "--- VLESS+Reality 链接 (TCP) ---"
 echo "$VLESS_URI"
+echo ""
+echo "--- Hysteria2 链接 (QUIC/UDP) ---"
+echo "$HY2_URI"
 echo ""
 echo "--- 通用订阅链接（V2Box / v2rayNG / NekoBox 等） ---"
 echo "http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.txt"
@@ -328,5 +447,8 @@ echo "--- Clash / Clash Box 专用订阅链接（YAML格式） ---"
 echo "http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.yaml"
 echo ""
 echo "⚠️  请妥善保管以上链接，不要发给不信任的人。"
-echo "⚠️  别忘了去云平台控制台放行 ${LISTEN_PORT} 和 ${SUB_PORT} 端口。"
+echo "⚠️  别忘了去云平台控制台放行以下端口："
+echo "    ${LISTEN_PORT}/tcp  (VLESS+Reality)"
+echo "    ${SUB_PORT}/tcp     (订阅服务)"
+echo "    ${HY2_PORT}/udp    (Hysteria2 / QUIC)"
 echo "======================================================"
