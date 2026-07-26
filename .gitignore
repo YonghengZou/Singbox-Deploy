@@ -1,0 +1,5 @@
+# Ignore runtime deployment artifacts and secrets
+/etc/sing-box/
+/var/www/sub/
+*.log
+*.tmp
