@@ -4,6 +4,13 @@
 # 特点：幂等设计，已安装/已生成的内容会自动跳过，避免重复消耗流量
 # 适用于 Debian/Ubuntu 系统，默认会自动安装必要依赖并生成可直接使用的订阅链接。
 #
+# 【本版针对 Oracle Cloud VM.Standard.E2.1.Micro (1 OCPU / 1GB RAM / 0.48Gbps) 优化】
+# 新增内容：
+#   - swap 文件（防止 1GB 内存下 OOM 拖慢/杀死进程）
+#   - VLESS+Reality 开启 XTLS Vision 流控（flow: xtls-rprx-vision），降低加解密开销
+#   - Hysteria2 显式设置 up_mbps/down_mbps，避免拥塞控制估算过激或过保守
+#   - 订阅链接（通用 txt / Clash yaml）同步带上以上参数，客户端才能生效
+#
 set -e
 
 # 默认使用较保守的权限，避免生成文件被其他用户读取。
@@ -22,6 +29,14 @@ HY2_DOMAIN="${HY2_DOMAIN:-singbox.local}"
 REALITY_SNI="${REALITY_SNI:-swdist.apple.com}"
 SHOW_SECRETS="${SHOW_SECRETS:-0}"
 
+# --- 针对小机型（如 E2.1.Micro：1 OCPU/1GB/0.48Gbps）的带宽/内存相关参数 ---
+# 两个协议同时跑时，Hysteria2 的带宽估算不宜设太高，否则拥塞控制会在单核 CPU
+# 加解密跟不上时依然按高速率发送，反而加剧丢包。可通过环境变量覆盖。
+HY2_UP_MBPS="${HY2_UP_MBPS:-150}"
+HY2_DOWN_MBPS="${HY2_DOWN_MBPS:-150}"
+# swap 大小（GB），1GB 内存机型建议保留，避免内存紧张时被 OOM killer 杀掉服务进程。
+SWAP_SIZE_GB="${SWAP_SIZE_GB:-1}"
+
 # 状态目录与持久化文件
 # 用于保存 UUID、Reality 密钥对、订阅 token 和部署详情，避免重复生成导致客户端配置失效。
 STATE_DIR="/etc/sing-box"
@@ -29,6 +44,33 @@ STATE_FILE="${STATE_DIR}/keys.env"
 SUB_STATE_FILE="${STATE_DIR}/sub_token.env"
 DEPLOYMENT_INFO_FILE="${STATE_DIR}/deployment-info.txt"
 
+echo "################################################"
+echo "# 0. 配置 Swap（幂等，防止小内存机型 OOM）      #"
+echo "################################################"
+
+# 1GB 内存的机型（如 Oracle E2.1.Micro）在 sing-box + nginx 同时运行、
+# 加解密负载较高时容易内存紧张，加一块 swap 兜底，避免进程被 OOM killer 杀掉
+# 或频繁触发内存回收导致的延迟抖动。已存在则跳过，避免重复分配。
+SWAP_FILE="/swapfile"
+if sudo swapon --show | grep -q "${SWAP_FILE}"; then
+    echo "✅ swap 已启用（${SWAP_FILE}），跳过创建。"
+elif [ -f "${SWAP_FILE}" ]; then
+    echo "检测到 ${SWAP_FILE} 已存在但未启用，直接启用..."
+    sudo swapon "${SWAP_FILE}"
+    echo "✅ swap 已启用"
+else
+    echo "未检测到 swap，创建 ${SWAP_SIZE_GB}GB swap 文件..."
+    sudo fallocate -l "${SWAP_SIZE_GB}G" "${SWAP_FILE}" || sudo dd if=/dev/zero of="${SWAP_FILE}" bs=1M count=$((SWAP_SIZE_GB * 1024))
+    sudo chmod 600 "${SWAP_FILE}"
+    sudo mkswap "${SWAP_FILE}" > /dev/null
+    sudo swapon "${SWAP_FILE}"
+    if ! grep -qE "^\s*${SWAP_FILE}\s" /etc/fstab; then
+        echo "${SWAP_FILE} none swap sw 0 0" | sudo tee -a /etc/fstab > /dev/null
+    fi
+    echo "✅ swap 已创建并启用（${SWAP_SIZE_GB}GB），已写入 /etc/fstab 持久化"
+fi
+
+echo ""
 echo "################################################"
 echo "# 1. 安装 sing-box（如已是目标版本则跳过下载） #"
 echo "################################################"
@@ -138,6 +180,9 @@ echo "################################################"
 
 # 写入 sing-box 的服务端配置文件：使用 VLESS + Reality 方案。
 # 其中 UUID、私钥和 ShortID 由上一步生成并复用。
+# 【优化】VLESS 用户加 flow: xtls-rprx-vision，减少一层内层 TLS 加解密开销，提速明显。
+# 【优化】Hysteria2 inbound 显式设置 up_mbps/down_mbps，避免拥塞控制估算不准
+#         （两个协议共用 1 个 OCPU 时尤其重要，数值可用 HY2_UP_MBPS/HY2_DOWN_MBPS 环境变量覆盖）。
 sudo tee /etc/sing-box/config.json > /dev/null << EOF
 {
   "log": {
@@ -151,7 +196,8 @@ sudo tee /etc/sing-box/config.json > /dev/null << EOF
       "listen_port": ${LISTEN_PORT},
       "users": [
         {
-          "uuid": "${UUID}"
+          "uuid": "${UUID}",
+          "flow": "xtls-rprx-vision"
         }
       ],
       "tls": {
@@ -172,6 +218,8 @@ sudo tee /etc/sing-box/config.json > /dev/null << EOF
       "type": "hysteria2",
       "listen": "::",
       "listen_port": ${HY2_PORT},
+      "up_mbps": ${HY2_UP_MBPS},
+      "down_mbps": ${HY2_DOWN_MBPS},
       "users": [
         {
           "password": "${HY2_PASSWORD}"
@@ -194,7 +242,7 @@ EOF
 
 sudo chmod 600 /etc/sing-box/config.json
 sudo sing-box check -c /etc/sing-box/config.json
-echo "✅ 配置文件语法检查通过"
+echo "✅ 配置文件语法检查通过（VLESS Vision + Hysteria2 带宽限制已启用）"
 
 echo ""
 echo "################################################"
@@ -272,6 +320,20 @@ echo "✅ conntrack_max=$CURRENT_CONNTRACK  somaxconn=$CURRENT_SOMAXCONN  swappi
 
 echo ""
 echo "################################################"
+echo "# 3c. 提升 sing-box 服务的文件描述符限制（幂等） #"
+echo "################################################"
+
+# 高并发下 sing-box 容易因为 ulimit 不够导致连接被拒或延迟增加。
+sudo install -d -m 755 /etc/systemd/system/sing-box.service.d
+sudo tee /etc/systemd/system/sing-box.service.d/limits.conf > /dev/null << 'EOF'
+[Service]
+LimitNOFILE=1048576
+EOF
+sudo systemctl daemon-reload
+echo "✅ 已设置 sing-box 服务 LimitNOFILE=1048576"
+
+echo ""
+echo "################################################"
 echo "# 4. 启动/重启 sing-box 服务                    #"
 echo "################################################"
 
@@ -327,6 +389,9 @@ echo "    - ${LISTEN_PORT}/tcp  (VLESS+Reality)"
 echo "    - ${SUB_PORT}/tcp     (订阅服务)"
 echo "    - ${HY2_PORT}/udp    (Hysteria2 / QUIC)"
 echo "    服务器内部防火墙放行不代表云平台外层也放行。"
+echo "    （Oracle Cloud 用户注意：默认 Security List 只放行 22 端口，务必去"
+echo "     VCN -> 子网 -> Security List -> Ingress Rules 手动添加以上规则，"
+echo "     否则脚本执行成功也无法连接。）"
 
 echo ""
 echo "################################################"
@@ -363,11 +428,13 @@ EOF
 fi
 
 # 生成通用的 VLESS 链接，并将其编码为 base64，适配大多数客户端。
-VLESS_URI="vless://${UUID}@${SERVER_IP}:${LISTEN_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#my-vless-reality"
+# 【优化】加上 flow=xtls-rprx-vision，必须和服务端一致才能生效。
+VLESS_URI="vless://${UUID}@${SERVER_IP}:${LISTEN_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none&flow=xtls-rprx-vision#my-vless-reality"
 
 # 生成 Hysteria2 链接（基于 QUIC/UDP）。
 # insecure=1 表示跳过自签证书校验，方便快速使用；如使用真实证书可去掉该参数。
-HY2_URI="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}?sni=${HY2_DOMAIN}&insecure=1#my-hysteria2"
+# 【优化】加上 up/down 参数，与服务端 up_mbps/down_mbps 对应，帮助客户端更准确地估算带宽。
+HY2_URI="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}?sni=${HY2_DOMAIN}&insecure=1&up=${HY2_UP_MBPS}&down=${HY2_DOWN_MBPS}#my-hysteria2"
 
 # 多节点订阅：将两条链接按行拼接后整体 base64 编码。
 ENCODED=$(printf "%s\n%s" "$VLESS_URI" "$HY2_URI" | base64 -w 0)
@@ -388,6 +455,8 @@ VLESS_URI=${VLESS_URI}
 HY2_PASSWORD=${HY2_PASSWORD}
 HY2_DOMAIN=${HY2_DOMAIN}
 HY2_URI=${HY2_URI}
+HY2_UP_MBPS=${HY2_UP_MBPS}
+HY2_DOWN_MBPS=${HY2_DOWN_MBPS}
 SUB_URL_TXT=http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.txt
 SUB_URL_YAML=http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.yaml
 EOF
@@ -395,6 +464,7 @@ sudo chmod 600 "$DEPLOYMENT_INFO_FILE"
 
 # Clash / Clash Box (Mihomo内核) 专用订阅，格式必须是完整 YAML，不能用 base64。
 # 这份内容适用于支持 Mihomo 的客户端，便于直接导入代理配置。
+# 【优化】vless 节点加 flow，hysteria2 节点加 up/down。
 sudo tee /var/www/sub/${SUB_TOKEN}.yaml > /dev/null << YAMLEOF
 port: 7890
 socks-port: 7891
@@ -411,6 +481,7 @@ proxies:
     network: tcp
     tls: true
     udp: true
+    flow: xtls-rprx-vision
     servername: ${REALITY_SNI}
     client-fingerprint: chrome
     reality-opts:
@@ -423,6 +494,8 @@ proxies:
     password: ${HY2_PASSWORD}
     sni: ${HY2_DOMAIN}
     skip-cert-verify: true
+    up: ${HY2_UP_MBPS} Mbps
+    down: ${HY2_DOWN_MBPS} Mbps
 
 proxy-groups:
   - name: "PROXY"
@@ -476,9 +549,11 @@ echo "UUID:             $UUID"
 echo "PublicKey:        $PUBLIC_KEY"
 echo "ShortID:          $SHORT_ID"
 echo "伪装域名 (SNI):    $REALITY_SNI"
+echo "Vision 流控:       已启用 (xtls-rprx-vision)"
 echo ""
 echo "Hysteria2 密码:    $HY2_PASSWORD"
 echo "Hysteria2 域名:    $HY2_DOMAIN"
+echo "Hysteria2 带宽:    up=${HY2_UP_MBPS}Mbps down=${HY2_DOWN_MBPS}Mbps（可用 HY2_UP_MBPS/HY2_DOWN_MBPS 环境变量调整）"
 echo ""
 echo "--- VLESS+Reality 链接 (TCP) ---"
 echo "$VLESS_URI"
@@ -497,4 +572,5 @@ echo "⚠️  别忘了去云平台控制台放行以下端口："
 echo "    ${LISTEN_PORT}/tcp  (VLESS+Reality)"
 echo "    ${SUB_PORT}/tcp     (订阅服务)"
 echo "    ${HY2_PORT}/udp    (Hysteria2 / QUIC)"
+echo "    Oracle Cloud 用户：VCN -> 子网 -> Security List -> Ingress Rules"
 echo "======================================================"
