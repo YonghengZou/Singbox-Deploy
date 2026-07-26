@@ -235,6 +235,24 @@ ensure_sysctl "net.ipv4.tcp_mtu_probing" "1"
 # 降低发送队列低水位，减少缓冲延迟。
 ensure_sysctl "net.ipv4.tcp_notsent_lowat" "16384"
 
+# 连接跟踪表扩容：代理服务器并发连接多，默认 conntrack 表小会丢连接。
+# 仅在内核加载了 nf_conntrack 模块时生效（无该模块时 sysctl -p 会报错忽略，不影响其他项）。
+ensure_sysctl "net.netfilter.nf_conntrack_max" "1048576"
+ensure_sysctl "net.netfilter.nf_conntrack_tcp_timeout_established" "7200"
+
+# 本地端口范围 & TIME_WAIT 复用：代理作为出口会消耗大量临时端口。
+ensure_sysctl "net.ipv4.ip_local_port_range" "1024 65535"
+ensure_sysctl "net.ipv4.tcp_tw_reuse" "1"
+
+# 监听队列 & SYN backlog：应对突发连接，避免握手丢包。
+ensure_sysctl "net.core.somaxconn" "4096"
+ensure_sysctl "net.ipv4.tcp_max_syn_backlog" "8192"
+
+# TCP 窗口缩放/SACK/timestamps：长肥管道和高丢包链路必备（通常默认开，这里确保开启）。
+ensure_sysctl "net.ipv4.tcp_window_scaling" "1"
+ensure_sysctl "net.ipv4.tcp_sack" "1"
+ensure_sysctl "net.ipv4.tcp_timestamps" "1"
+
 sudo sysctl -p > /dev/null
 
 # 验证关键项是否生效。
@@ -242,7 +260,10 @@ CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
 CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
 CURRENT_TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "未知")
 CURRENT_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
-echo "✅ qdisc=$CURRENT_QDISC  TCP CC=$CURRENT_CC  TFO=$CURRENT_TFO  rmem_max=$CURRENT_RMEM"
+CURRENT_CONNTRACK=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "未加载")
+CURRENT_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "未知")
+echo "✅ qdisc=$CURRENT_QDISC  CC=$CURRENT_CC  TFO=$CURRENT_TFO  rmem_max=$CURRENT_RMEM"
+echo "✅ conntrack_max=$CURRENT_CONNTRACK  somaxconn=$CURRENT_SOMAXCONN"
 
 echo ""
 echo "################################################"
